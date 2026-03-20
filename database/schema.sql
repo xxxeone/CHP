@@ -28,6 +28,7 @@ CREATE TABLE users (
     referred_by     UUID REFERENCES users(id),             -- 推荐人
     push_token      TEXT,                                  -- 推送通知 token
     is_active       BOOLEAN DEFAULT true,
+    is_admin        BOOLEAN DEFAULT false,                 -- 管理员标志
     email_verified  BOOLEAN DEFAULT false,
     phone_verified  BOOLEAN DEFAULT false,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -438,6 +439,19 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- OTP CODES TABLE - 短信验证码表
+-- ============================================================
+CREATE TABLE otp_codes (
+    phone       VARCHAR(20) PRIMARY KEY,
+    code        VARCHAR(255) NOT NULL,                     -- bcrypt hashed
+    expires_at  TIMESTAMPTZ NOT NULL,
+    attempts    INTEGER DEFAULT 0,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================================
 
 CREATE TRIGGER trg_generate_referral_code
     BEFORE INSERT ON users

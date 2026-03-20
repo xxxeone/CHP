@@ -141,9 +141,107 @@ exports.sendOTP = async (req, res, next) => {
     );
 
     // In production: send SMS via Twilio
-    console.log(`OTP for ${phone}: ${otp}`);
+    // const client = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    // await client.messages.create({ body: `CHP验证码: ${otp}`, from: process.env.TWILIO_FROM_NUMBER, to: phone });
+    console.log(`[OTP] ${phone}: ${otp}`); // dev only — remove in production
 
     res.json({ message: '验证码已发送 / OTP sent', expiresIn: 600 });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/auth/verify-otp
+exports.verifyOTP = async (req, res, next) => {
+  try {
+    const { phone, code } = req.body;
+    const { rows: [otpRow] } = await db.query(
+      'SELECT * FROM otp_codes WHERE phone = $1', [phone]
+    );
+    if (!otpRow)
+      return res.status(400).json({ error: '验证码不存在 / OTP not found' });
+    if (new Date(otpRow.expires_at) < new Date())
+      return res.status(400).json({ error: '验证码已过期 / OTP expired' });
+    if (otpRow.attempts >= 5)
+      return res.status(429).json({ error: '尝试次数过多 / Too many attempts' });
+
+    const valid = await bcrypt.compare(code, otpRow.code);
+    if (!valid) {
+      await db.query('UPDATE otp_codes SET attempts = attempts + 1 WHERE phone = $1', [phone]);
+      return res.status(400).json({ error: '验证码错误 / Invalid OTP' });
+    }
+
+    // Consume OTP
+    await db.query('DELETE FROM otp_codes WHERE phone = $1', [phone]);
+
+    // Find or create user
+    let { rows: [user] } = await db.query(
+      'SELECT id, phone, email, first_name, last_name, membership_tier, is_active FROM users WHERE phone = $1',
+      [phone]
+    );
+    if (!user) {
+      // Auto-register with phone only
+      const { rows: [newUser] } = await db.query(
+        `INSERT INTO users (phone, first_name, last_name, phone_verified)
+         VALUES ($1, '用户', phone, true) RETURNING id, phone, first_name, last_name, membership_tier`,
+        [phone]
+      );
+      user = newUser;
+    }
+
+    await db.query('UPDATE users SET phone_verified = true, last_login_at = NOW() WHERE id = $1', [user.id]);
+
+    const token = generateToken(user.id);
+    const refreshToken = generateRefreshToken(user.id);
+    res.json({ user, token, refreshToken });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/auth/logout
+exports.logout = async (req, res, next) => {
+  // JWT is stateless — client should discard the token.
+  // For production: maintain a token blacklist in Redis.
+  res.json({ message: '已退出登录 / Logged out' });
+};
+
+// PUT /api/auth/change-password
+exports.changePassword = async (req, res, next) => {
+  try {
+    const { current_password, new_password } = req.body;
+    const { rows: [user] } = await db.query(
+      'SELECT password_hash FROM users WHERE id = $1', [req.user.id]
+    );
+    if (!user.password_hash || !(await bcrypt.compare(current_password, user.password_hash)))
+      return res.status(400).json({ error: '当前密码不正确 / Incorrect current password' });
+
+    const hash = await bcrypt.hash(new_password, 12);
+    await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, req.user.id]);
+    res.json({ message: '密码已修改 / Password changed' });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/auth/forgot-password
+exports.forgotPassword = async (req, res, next) => {
+  try {
+    const { phone } = req.body;
+    const { rows: [user] } = await db.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    // Always respond 200 to prevent user enumeration
+    if (user) {
+      // Reuse sendOTP logic to send a reset code
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      await db.query(
+        `INSERT INTO otp_codes (phone, code, expires_at) VALUES ($1, $2, $3)
+         ON CONFLICT (phone) DO UPDATE SET code = $2, expires_at = $3, attempts = 0`,
+        [phone, await bcrypt.hash(otp, 6), expiresAt]
+      );
+      console.log(`[RESET OTP] ${phone}: ${otp}`); // dev only
+    }
+    res.json({ message: '如账号存在，验证码已发送 / If account exists, OTP sent' });
   } catch (err) {
     next(err);
   }
